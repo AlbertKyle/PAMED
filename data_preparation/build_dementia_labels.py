@@ -23,17 +23,17 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from project_paths import DATA_ROOT, RESULTS_ROOT
 
 import numpy as np
 import pandas as pd
 
 
-ROOT = Path(r"E:\PA_foundation_model")
-OUT_DIR = ROOT / "dementia"
-MAP_DIR = (
-    ROOT / "BEAT_S2_disease_fituning" / "BEAT_S2_disease_fituning"
-    / "New_Disease_Mapping"
-)
+ROOT = DATA_ROOT
+OUT_DIR = DATA_ROOT
+MAP_DIR = DATA_ROOT / "hospital_records"
 ICD_PATH = MAP_DIR / "41270.csv"
 DATE_PATH = MAP_DIR / "41280.csv"
 ACC_PATH = ROOT / "representative_mean_acc_wide_matched_7days_filtered_QC_pass_N80990.csv"
@@ -289,9 +289,19 @@ def save_codebook() -> pd.DataFrame:
 
 
 def main() -> None:
+    global ICD_PATH, DATE_PATH, ACC_PATH, BASELINE_PATH, WEAR_PATH, OUT_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunksize", type=int, default=4000)
+    parser.add_argument("--icd-csv", type=Path, default=ICD_PATH)
+    parser.add_argument("--diagnosis-dates-csv", type=Path, default=DATE_PATH)
+    parser.add_argument("--activity-csv", type=Path, default=ACC_PATH)
+    parser.add_argument("--baseline-csv", type=Path, default=BASELINE_PATH)
+    parser.add_argument("--wear-dates-csv", type=Path, default=WEAR_PATH)
+    parser.add_argument("--output-dir", type=Path, default=OUT_DIR)
     args = parser.parse_args()
+    ICD_PATH, DATE_PATH = args.icd_csv, args.diagnosis_dates_csv
+    ACC_PATH, BASELINE_PATH, WEAR_PATH = args.activity_csv, args.baseline_csv, args.wear_dates_csv
+    OUT_DIR = args.output_dir
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,

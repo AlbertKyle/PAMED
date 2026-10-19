@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frozen supplementary experiments for Dementia v13 final.
+"""Frozen supplementary experiments for PAMED.
 
 Stages never redraw the outer split and never choose a best random seed.  They
 produce tidy CSV/JSON outputs only; publication figures are intentionally left
@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import argparse, json, logging, os, random, shutil, subprocess, sys
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from project_paths import DATA_ROOT, RESULTS_ROOT
 from types import SimpleNamespace
 
 import joblib
@@ -20,13 +23,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 from torch.utils.data import DataLoader
 
-import v13_cohort_engine as v6
-import v13_core_80_20 as core
-import v13_fusion_engine as fusion
-import v13_mamba_engine as models
+import cohort
+import train_evaluate as core
+import fusion
+import pamed_models as models
 
-ROOT=Path("/root/autodl-tmp/PA_CR_CNN/Project_new/PA_Foundation_Model/dementia")
-RESULTS=ROOT/"Results"/"v13_final"
+ROOT=DATA_ROOT
+RESULTS=RESULTS_ROOT
 SEEDS=(20260820,20260821,20260822)
 
 
@@ -47,12 +50,12 @@ def seed_all(seed):
 
 def load_predictions(core_dir:Path):
  p=core_dir/"ukb_20pct_final_test_predictions.csv"
- if not p.exists():raise FileNotFoundError(f"Run v13 core first: {p}")
+ if not p.exists():raise FileNotFoundError(f"Run the core model stage first: {p}")
  x=pd.read_csv(p,dtype={"eid":"string"});x.eid=x.eid.str.strip();return x
 
 
 def load_cohort(cfg):
- return v6.load_cohort(v6.Config(cfg.labels_csv,cfg.apoe_csv,cfg.cache_dir,cfg.output_dir,horizon_years=7.))
+ return cohort.load_cohort(cohort.Config(cfg.labels_csv,cfg.apoe_csv,cfg.cache_dir,cfg.output_dir,horizon_years=7.))
 
 
 def split_indices(d,protocol:Path):
@@ -176,7 +179,7 @@ def experiment_cfg(cfg,out):
 def run_ablation(cfg):
  out=Path(cfg.output_dir);setup(out);ec=experiment_cfg(cfg,out);d=load_cohort(ec);y=d.target.to_numpy(np.int8);dev,test,itr,iva=split_indices(d,Path(cfg.protocol_dir));sel=Path(cfg.core_dir)/"epoch_selection"
  ztr=core.extract_pair(ec,d,y,itr,sel/"grufcn_best.pt",sel/"convcontext_mamba_best.pt");zva=core.extract_pair(ec,d,y,iva,sel/"grufcn_best.pt",sel/"convcontext_mamba_best.pt")
- pp=v6.tab_preprocessor(core.AGE_SEX);pp.fit(d.iloc[itr][core.AGE_SEX]);tab=np.asarray(pp.transform(d[core.AGE_SEX]),np.float32);trds=core.fusion_dataset(ztr,tab[itr]);vads=core.fusion_dataset(zva,tab[iva]);specs=[("no_residual_interaction_only",lambda:NoResidual(tab.shape[1])),("decision_only_no_feature_interaction",lambda:DecisionOnly(tab.shape[1])),("gru_plus_age_sex",lambda:SinglePAClinical("gru",tab.shape[1])),("mamba_plus_age_sex",lambda:SinglePAClinical("mamba",tab.shape[1]))]
+ pp=cohort.tab_preprocessor(core.AGE_SEX);pp.fit(d.iloc[itr][core.AGE_SEX]);tab=np.asarray(pp.transform(d[core.AGE_SEX]),np.float32);trds=core.fusion_dataset(ztr,tab[itr]);vads=core.fusion_dataset(zva,tab[iva]);specs=[("no_residual_interaction_only",lambda:NoResidual(tab.shape[1])),("decision_only_no_feature_interaction",lambda:DecisionOnly(tab.shape[1])),("gru_plus_age_sex",lambda:SinglePAClinical("gru",tab.shape[1])),("mamba_plus_age_sex",lambda:SinglePAClinical("mamba",tab.shape[1]))]
  locked={};hist=[];cal={};threshold={};selection=out/"selection";selection.mkdir(exist_ok=True)
  for j,(name,factory) in enumerate(specs):
   score,ep,h,_,_=fusion.train_head(name,factory(),trds,vads,ec,selection,cfg.seed+50+j);locked[name]=ep;hist.extend(h);cal[name],threshold[name]=core.fit_platt_threshold(y[iva],score,.80)
@@ -195,8 +198,10 @@ def run_stability(cfg):
  for seed in SEEDS:
   target=source if seed==SEEDS[0] else out/f"seed_{seed}"
   if seed!=SEEDS[0] and not (target/"COMPLETED.json").exists():
-   target.mkdir(parents=True,exist_ok=True);shutil.copy2(protocol/"ukb_fixed_80_20_split.csv",target/"ukb_fixed_80_20_split.csv")
-   cmd=[sys.executable,str(Path(__file__).with_name("v13_core_80_20.py")),"--mode","full","--labels-csv",cfg.labels_csv,"--apoe-csv",cfg.apoe_csv,"--cache-dir",cfg.cache_dir,"--output-dir",str(target),"--seed",str(seed),"--split-seed","20260820","--bootstrap-repeats","500"]
+   target.mkdir(parents=True,exist_ok=True)
+   for partition_file in ("ukb_fixed_80_20_split.csv","development_internal_epoch_selection.csv"):
+    shutil.copy2(protocol/partition_file,target/partition_file)
+   cmd=[sys.executable,str(Path(__file__).with_name("train_evaluate.py")),"--mode","full","--labels-csv",cfg.labels_csv,"--apoe-csv",cfg.apoe_csv,"--cache-dir",cfg.cache_dir,"--output-dir",str(target),"--seed",str(seed),"--split-seed","20260820","--bootstrap-repeats","500"]
    logging.info("Starting prespecified stability seed %d",seed);subprocess.run(cmd,cwd=Path(__file__).parent,check=True)
   x=load_predictions(target);x["seed"]=seed;runs.append(x)
  base=runs[0][["eid","target"]].copy();models_available=[c.removeprefix("probability_") for c in runs[0] if c.startswith("probability_")];per=[]
@@ -217,7 +222,7 @@ def infer_occluded(cfg,d,test,tab,window,device,gm,cm,head,cal,loc,scale):
    if day is None:a[:, :, start:end]=0;m[:, :, start:end]=False
    else:a[:,day,start:end]=0;m[:,day,start:end]=False
   z=(np.log1p(np.clip(np.nan_to_num(a,nan=0.),0,None))-loc)/scale;z=np.where(m,z,0.);x=torch.from_numpy(np.stack([z.reshape(len(a),-1),m.astype(np.float32).reshape(len(a),-1)],1).astype(np.float32)).to(device);tb=torch.from_numpy(tab[test[st:en]]).to(device);e=torch.zeros((len(x),1),device=device)
-  with torch.no_grad(),v6.amp_ctx(device,cfg.amp):g=gm.encoder(x);c=cm.encoder(x);gl=gm.risk(g).squeeze(-1);cl=cm.risk(c).squeeze(-1);s=head(g,c,gl,cl,tb,e)
+  with torch.no_grad(),cohort.amp_ctx(device,cfg.amp):g=gm.encoder(x);c=cm.encoder(x);gl=gm.risk(g).squeeze(-1);cl=cm.risk(c).squeeze(-1);s=head(g,c,gl,cl,tb,e)
   scores.append(s.float().cpu().numpy())
  raw=np.concatenate(scores);return raw,cal.predict_proba(raw.reshape(-1,1))[:,1]
 
@@ -239,14 +244,14 @@ def run_interpretability(cfg):
 
 
 def smoke(cfg):
- out=Path(cfg.output_dir);setup(out);required=[Path(cfg.core_dir)/"COMPLETED.json",Path(cfg.protocol_dir)/"V13_PROTOCOL_LOCK.json",Path(cfg.core_dir)/"ukb_20pct_final_test_predictions.csv"]
+ out=Path(cfg.output_dir);setup(out);required=[Path(cfg.core_dir)/"COMPLETED.json",Path(cfg.protocol_dir)/"PROTOCOL_LOCK.json",Path(cfg.core_dir)/"ukb_20pct_final_test_predictions.csv"]
  missing=[str(p) for p in required if not p.exists()]
  if missing:raise FileNotFoundError("Missing prerequisites:\n"+"\n".join(missing))
  atomic_json(out/"SMOKE_COMPLETED.json",{"completed":True,"stage":cfg.stage,"prerequisites":required})
 
 
 if __name__=="__main__":
- a=argparse.ArgumentParser();a.add_argument("stage",choices=["supplement_smoke","stability","paired","subgroups","ablation","interpretability","decision"]);a.add_argument("--labels-csv",default=str(ROOT/"ukb_dementia_labels_covariates_N80990.csv"));a.add_argument("--apoe-csv",default=str(ROOT/"APOE_phenotype.csv"));a.add_argument("--cache-dir",default=str(ROOT/"supervised_results"/"cache"));a.add_argument("--core-dir",default=str(RESULTS/"02_core_model"));a.add_argument("--protocol-dir",default=str(RESULTS/"00_protocol"));a.add_argument("--stability-dir",default=str(RESULTS/"05_stability"));a.add_argument("--output-dir",required=True);a.add_argument("--bootstrap-repeats",type=int,default=2000);a.add_argument("--subgroup-bootstrap-repeats",type=int,default=1000);a.add_argument("--eval-batch-size",type=int,default=256);a.add_argument("--num-workers",type=int,default=6);a.add_argument("--seed",type=int,default=20260820);a.add_argument("--amp",action=argparse.BooleanOptionalAction,default=True);cfg=a.parse_args()
+ a=argparse.ArgumentParser();a.add_argument("stage",choices=["supplement_smoke","stability","paired","subgroups","ablation","interpretability","decision"]);a.add_argument("--labels-csv",default=str(ROOT/"ukb_dementia_labels_covariates_N80990.csv"));a.add_argument("--apoe-csv",default=str(ROOT/"APOE_phenotype.csv"));a.add_argument("--cache-dir",default=str(ROOT/"cache"));a.add_argument("--core-dir",default=str(RESULTS/"02_core_model"));a.add_argument("--protocol-dir",default=str(RESULTS/"00_protocol"));a.add_argument("--stability-dir",default=str(RESULTS/"05_stability"));a.add_argument("--output-dir",required=True);a.add_argument("--bootstrap-repeats",type=int,default=2000);a.add_argument("--subgroup-bootstrap-repeats",type=int,default=1000);a.add_argument("--eval-batch-size",type=int,default=256);a.add_argument("--num-workers",type=int,default=6);a.add_argument("--seed",type=int,default=20260820);a.add_argument("--amp",action=argparse.BooleanOptionalAction,default=True);cfg=a.parse_args()
  if cfg.stage=="supplement_smoke":smoke(cfg)
  elif cfg.stage=="stability":run_stability(cfg)
  elif cfg.stage=="paired":run_paired(cfg)

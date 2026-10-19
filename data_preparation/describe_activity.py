@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse, json, logging, math, sys, warnings
 from datetime import datetime
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from project_paths import DATA_ROOT, RESULTS_ROOT
 
 import matplotlib
 matplotlib.use("Agg")
@@ -26,14 +29,14 @@ NAVY = "#20364B"
 GOLD = "#D6A84B"
 GREY = "#68737D"
 PALE = "#E8EEF0"
-CMAP = LinearSegmentedColormap.from_list("nature", ["#F6F8F8", "#BFD9D8", CONTROL, NAVY])
+CMAP = LinearSegmentedColormap.from_list("activity", ["#F6F8F8", "#BFD9D8", CONTROL, NAVY])
 
 CONT = ["enrollment_age", "BMI", "Townsend_index", "Followingyears_birthday",
         "Light_Total_Hour", "MVPA_Total_Hour", "Sedentary_Total_Hour", "Sleep_Total_Hour"]
 CAT = ["gender", "Disable_long", "education_level", "smoking", "alcohol_use",
        "ethic", "overall_health", "is_dead"]
 LABEL = {
-    "enrollment_age":"Age at recruitment, years", "BMI":"Body mass index, kg m$^{-2}$",
+    "enrollment_age":"Age at accelerometry, years", "BMI":"Body mass index, kg m$^{-2}$",
     "Townsend_index":"Townsend deprivation index", "Followingyears_birthday":"Age at end of follow-up, years",
     "Light_Total_Hour":"Light activity, h day$^{-1}$", "MVPA_Total_Hour":"MVPA, h day$^{-1}$",
     "Sedentary_Total_Hour":"Sedentary time, h day$^{-1}$", "Sleep_Total_Hour":"Sleep duration, h day$^{-1}$",
@@ -340,7 +343,7 @@ def make_figures(df,metrics,hourly,daily,agg,dayhour,subtypes,events,out):
     # 16 age distribution
     fig,ax=plt.subplots(figsize=(5.5,3.6)); bins=np.arange(38,77,2)
     for g,col,lab in [(0,CONTROL,"Control"),(1,CASE,"Incident dementia")]: ax.hist(df.loc[df.target.eq(g),"enrollment_age"],bins=bins,density=True,histtype="step",lw=1.7,color=col,label=lab)
-    ax.set(xlabel="Age at recruitment, years",ylabel="Density",title="Age distribution"); ax.legend(); clean_ax(ax); paths.append(save_single(fig,"16_age_distribution",out))
+    ax.set(xlabel="Age at accelerometry, years",ylabel="Density",title="Age distribution"); ax.legend(); clean_ax(ax); paths.append(save_single(fig,"16_age_distribution",out))
     # 17 age-band risk (descriptive proportion)
     agebin=pd.cut(df.enrollment_age,[35,50,55,60,65,70,80],right=False); z=df.groupby(agebin,observed=True).target.agg(["sum","count"]); z["pct"]=100*z["sum"]/z["count"]
     fig,ax=plt.subplots(figsize=(5.5,3.6)); ax.bar(np.arange(len(z)),z.pct,color=CASE,width=.7); ax.set_xticks(np.arange(len(z)),[str(x) for x in z.index],rotation=30,ha="right"); ax.set(xlabel="Age band, years",ylabel="Incident dementia, %",title="Incident dementia proportion by baseline age"); clean_ax(ax); paths.append(save_single(fig,"17_incident_proportion_by_age",out))
@@ -411,8 +414,8 @@ def atlas(paths,out,df):
 def main():
     global ARGS
     ap=argparse.ArgumentParser(); ap.add_argument("--labels",type=Path,required=True); ap.add_argument("--subtypes",type=Path,required=True); ap.add_argument("--events",type=Path); ap.add_argument("--activity",type=Path,required=True); ap.add_argument("--out",type=Path,required=True); ARGS=ap.parse_args(); setup(ARGS.out)
-    df=pd.read_csv(ARGS.labels,dtype={"eid":"string"},low_memory=False); df=df[df.incident_analysis_eligible.eq(1)&df.incident_dementia_after_1y.isin([0,1])].copy().reset_index(drop=True); df["target"]=df.incident_dementia_after_1y.astype(int)
-    if len(df)!=80934 or df.target.sum()!=645: logging.warning("Cohort differs from expected N=80,934/cases=645: N=%d cases=%d",len(df),df.target.sum())
+    from study_design import fixed_window_cohort
+    df=fixed_window_cohort(pd.read_csv(ARGS.labels,dtype={"eid":"string"},low_memory=False))
     logging.info("Eligible cohort N=%d; incident cases=%d; controls=%d",len(df),df.target.sum(),(df.target==0).sum())
     raw1,pub1=table1(df); export_table(raw1,pub1,"Table_1_baseline_characteristics",ARGS.out)
     metrics,hourly,daily,agg=derive_stream(ARGS.activity,df[["eid","target"]],ARGS.out)

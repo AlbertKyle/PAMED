@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Frozen clinical extensions for Dementia v13.
+"""Clinical analyses of the frozen PAMED representations and predictions.
 
 No stage in this file changes the primary model, preprocessing, split, or
 threshold.  The script reuses frozen representations and predictions to study
 subtypes, hierarchical temporal Shapley values, landmark survival, effect
 modification, mortality/comorbidity associations, and prespecified paired
-comparisons.  It writes tidy data and audit files only; publication graphics
-are deliberately deferred.
+comparisons. Concept analyses include unadjusted-for-volume primary estimates
+and separately identified activity-volume and common-scale sensitivities.
+Optional follow-up and death columns contain days since accelerometry; no
+death time is inferred from a binary mortality indicator.
 """
 from __future__ import annotations
 
-import argparse, itertools, json, logging, math, os, sys, warnings
+import argparse, itertools, json, logging, math, os, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from project_paths import DATA_ROOT, RESULTS_ROOT
 from types import SimpleNamespace
 
 import joblib
@@ -19,25 +23,25 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import stats
-from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.metrics import (average_precision_score, brier_score_loss,
-                             log_loss, mean_absolute_error, r2_score,
+                             mean_absolute_error, r2_score,
                              roc_auc_score)
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, RobustScaler, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
-import v13_cohort_engine as v6
-import v13_core_80_20 as core
-import v13_fusion_engine as fusion
-import v13_mamba_engine as backbones
-import v13_supplementary as sup
+import cohort
+import train_evaluate as core
+import fusion
+import pamed_models as backbones
+import sensitivity_analysis as sup
+from clinical_helpers import binomial_term, distribution_summary, full_sequence_iv
 
-ROOT=Path("/root/autodl-tmp/PA_CR_CNN/Project_new/PA_Foundation_Model/dementia")
-RESULTS=ROOT/"Results"/"v13_final"
+ROOT=DATA_ROOT
+RESULTS=RESULTS_ROOT
 HORIZON_DAYS=int(round(365.25*7));LANDMARK_DAYS=365
 SUBTYPES={
  "alzheimers_disease":"days_accel_to_alzheimers_disease",
@@ -69,7 +73,7 @@ def safe_logit(p):
 
 
 def load_d(cfg):
- return v6.load_cohort(v6.Config(cfg.labels_csv,cfg.apoe_csv,cfg.cache_dir,cfg.output_dir,horizon_years=7.))
+ return cohort.load_cohort(cohort.Config(cfg.labels_csv,cfg.apoe_csv,cfg.cache_dir,cfg.output_dir,horizon_years=7.))
 
 
 def split(d,cfg):return sup.split_indices(d,Path(cfg.protocol_dir))[:2]
@@ -106,7 +110,7 @@ def run_representations(cfg):
  for j in range(ncomp):q[f"latent_pc{j+1:02d}"]=pcs[:,j]
  q.to_csv(out/"frozen_latent_pcs.csv",index=False);pd.DataFrame({"component":np.arange(1,ncomp+1),"explained_variance_ratio":pca.explained_variance_ratio_,"cumulative_explained_variance":np.cumsum(pca.explained_variance_ratio_)}).to_csv(out/"latent_pca_variance.csv",index=False)
  threshold=json.loads((core_dir/"locked_epochs_and_thresholds.json").read_text())["thresholds"]["final_hybrid"]
- atomic_json(out/"deployment_input_contract.json",{"model":"v13 final_hybrid fixed seed 20260820","input_activity_shape":[7,1440],"neural_channels":["log1p-scaled activity","observation mask"],"tabular_inputs":["baseline age","sex"],"forbidden_inputs":["follow-up age","death","comorbidity","post-baseline diagnoses"],"ukb_threshold":threshold,"warning":"Research risk stratification only; threshold and absolute probability are not transported to NHATS or consumer devices without prospective calibration.","minimum_device_qc":["exactly 7 local-midnight aligned days","minute timestamps and timezone retained","wear/missing mask retained","device-unit harmonization fixed","reject insufficient wear rather than silently zero-fill"]})
+ atomic_json(out/"deployment_input_contract.json",{"model":"PAMED","seed":cfg.seed,"input_activity_shape":[7,1440],"neural_channels":["log1p-scaled activity","observation mask"],"tabular_inputs":["age at accelerometry (enrollment_age)","sex"],"forbidden_inputs":["follow-up age","death","comorbidity","post-baseline diagnoses"],"ukb_threshold":threshold,"warning":"Research risk stratification only; threshold and absolute probability are not transported to NHATS or consumer devices without prospective calibration.","minimum_device_qc":["exactly 7 local-midnight aligned days","minute timestamps and timezone retained","wear/missing mask retained","device-unit harmonization fixed","reject insufficient wear rather than silently zero-fill"]})
  atomic_json(out/"COMPLETED.json",{"completed":True,"n":len(ids),"development_n":len(dev),"test_n":len(test),"latent_dimension":128,"pca_components":ncomp,"test_probability_max_abs_difference":maxdiff,"weights_changed":False})
  logging.info("COMPLETED representations N=%d test_probability_maxdiff=%.3g",len(ids),maxdiff)
 
@@ -172,7 +176,7 @@ def forward_array(x,tab,gm,cm,head,cal,device,batch):
  out=[]
  for st in range(0,len(x),batch):
   xx=torch.from_numpy(x[st:st+batch]).to(device);tt=torch.from_numpy(tab[st:st+batch]).to(device);e=torch.zeros((len(xx),1),device=device)
-  with torch.no_grad(),v6.amp_ctx(device,True):g=gm.encoder(xx);c=cm.encoder(xx);gl=gm.risk(g).squeeze(-1);cl=cm.risk(c).squeeze(-1);s=head(g,c,gl,cl,tt,e)
+  with torch.no_grad(),cohort.amp_ctx(device,True):g=gm.encoder(xx);c=cm.encoder(xx);gl=gm.risk(g).squeeze(-1);cl=cm.risk(c).squeeze(-1);s=head(g,c,gl,cl,tt,e)
   out.append(s.float().cpu().numpy())
  return calibrated_probability(cal,np.concatenate(out))
 
@@ -252,7 +256,9 @@ def circular_rolling_extrema(profile):
 
 
 def rhythm_batch(a,m,start_dates):
- safe=np.where(m,a,np.nan);profile=np.nanmean(safe,1);daily=np.nanmean(safe,2);overall=np.nanmean(safe,(1,2));day_sd=np.nanstd(daily,1);sameclock=np.nanmean(np.nanstd(safe,axis=1),1);adj=np.nanmean(np.abs(safe[:,1:]-safe[:,:-1]),(1,2));night=np.nanmean(profile[:,:360],1);morning=np.nanmean(profile[:,360:720],1);afternoon=np.nanmean(profile[:,720:1080],1);evening=np.nanmean(profile[:,1080:],1);iv=np.nanmean(np.diff(profile,axis=1)**2,1)/np.maximum(np.nanvar(profile,axis=1),1e-8);isd=np.nanvar(profile,axis=1)/np.maximum(np.nanvar(safe.reshape(len(a),-1),axis=1),1e-8)
+ """Compute concepts in raw activity units; IV uses ordered one-minute data."""
+ m=np.asarray(m,bool)&np.isfinite(a)
+ safe=np.where(m,a,np.nan);profile=np.nanmean(safe,1);daily=np.nanmean(safe,2);overall=np.nanmean(safe,(1,2));day_sd=np.nanstd(daily,1);sameclock=np.nanmean(np.nanstd(safe,axis=1),1);adj=np.nanmean(np.abs(safe[:,1:]-safe[:,:-1]),(1,2));night=np.nanmean(profile[:,:360],1);morning=np.nanmean(profile[:,360:720],1);afternoon=np.nanmean(profile[:,720:1080],1);evening=np.nanmean(profile[:,1080:],1);iv,_=full_sequence_iv(a,m);isd=np.nanvar(profile,axis=1)/np.maximum(np.nanvar(safe.reshape(len(a),-1),axis=1),1e-8)
  # Mean pairwise correlation of the seven aligned daily profiles.
  centered=safe-np.nanmean(safe,2,keepdims=True);centered=np.nan_to_num(centered);norm=np.sqrt(np.sum(centered**2,2));corr=np.einsum("bik,bjk->bij",centered,centered)/np.maximum(norm[:,:,None]*norm[:,None,:],1e-8);tri=np.triu_indices(7,1);regular=np.nanmean(corr[:,tri[0],tri[1]],1);m10,l5,m10time,l5time=circular_rolling_extrema(profile);ra=(m10-l5)/np.maximum(m10+l5,1e-8);weekday=[];weekend=[]
  for row,date in zip(daily,start_dates):
@@ -261,19 +267,43 @@ def rhythm_batch(a,m,start_dates):
 
 
 def run_rhythm_concepts(cfg):
- out=Path(cfg.output_dir);setup(out);d=load_d(cfg);dev,test=split(d,cfg);rep=load_rep(Path(cfg.representation_dir));act=np.load(Path(cfg.cache_dir)/"activity_7d.npy",mmap_mode="r");obs=np.load(Path(cfg.cache_dir)/"observed_7d.npy",mmap_mode="r");ci=d.cache_index.to_numpy(int);parts=[]
+ out=Path(cfg.output_dir);setup(out);d=load_d(cfg);dev,test=split(d,cfg);rep=load_rep(Path(cfg.representation_dir));act=np.load(Path(cfg.cache_dir)/"activity_7d.npy",mmap_mode="r");obs=np.load(Path(cfg.cache_dir)/"observed_7d.npy",mmap_mode="r");ci=d.cache_index.to_numpy(int);parts=[];quality=[]
  for st in range(0,len(d),cfg.rhythm_batch_size):
   en=min(st+cfg.rhythm_batch_size,len(d));a=np.asarray(act[ci[st:en]],np.float32);m=np.asarray(obs[ci[st:en]],bool);q=pd.DataFrame(rhythm_batch(a,m,d.accelerometer_start_date.iloc[st:en].to_numpy()));q.insert(0,"eid",d.eid.iloc[st:en].to_numpy());parts.append(q)
+  _,counts=full_sequence_iv(a,m);qc=pd.DataFrame(counts);qc.insert(0,"eid",d.eid.iloc[st:en].to_numpy());qc["minimum_observed_minutes_per_day"]=(m&np.isfinite(a)).sum(axis=2).min(axis=1);quality.append(qc)
   if en%4096==0 or en==len(d):logging.info("Rhythm concepts %d/%d",en,len(d))
- concepts=pd.concat(parts,ignore_index=True);concepts.to_csv(out/"posthoc_rhythm_concepts.csv",index=False);q=d[["eid","target","enrollment_age","gender"]].merge(concepts,on="eid",validate="one_to_one");lookup={e:i for i,e in enumerate(rep["eid"].astype(str))};rows=[];corr=[];concept_cols=[c for c in concepts if c!="eid"]
+ concepts=pd.concat(parts,ignore_index=True);concepts.to_csv(out/"posthoc_rhythm_concepts.csv",index=False);pd.concat(quality,ignore_index=True).to_csv(out/"rhythm_record_quality.csv",index=False);q=d[["eid","target","enrollment_age","gender"]].merge(concepts,on="eid",validate="one_to_one");lookup={e:i for i,e in enumerate(rep["eid"].astype(str))};rows=[];corr=[];summaries=[];sensitivity=[];concept_cols=[c for c in concepts if c!="eid"]
+ dev_stats={c:distribution_summary(pd.to_numeric(q.iloc[dev][c],errors="coerce")) for c in concept_cols}
+ cross_day=["day_mean_sd","sameclock_between_day_sd","adjacent_day_absolute_change"]
  for split_name,ids in [("development",dev),("test",test)]:
   z=q.iloc[ids];rr=np.array([lookup[str(e)] for e in z.eid],int);risk=rep["final_probability"][rr]
   for c in concept_cols:
-   v=pd.to_numeric(z[c],errors="coerce").to_numpy();age=pd.to_numeric(z.enrollment_age,errors="coerce").to_numpy();sex=(pd.to_numeric(z.gender,errors="coerce").to_numpy()==2).astype(float);y=z.target.to_numpy(int);ok=np.isfinite(v)&np.isfinite(age)
+   v=pd.to_numeric(z[c],errors="coerce").to_numpy();age=pd.to_numeric(z.enrollment_age,errors="coerce").to_numpy();gender=pd.to_numeric(z.gender,errors="coerce").to_numpy();sex=(gender==2).astype(float);y=z.target.to_numpy(int);ok=np.isfinite(v)&np.isfinite(age)&np.isfinite(gender)
+   summary=distribution_summary(v[ok]);summaries.append({"split":split_name,"concept":c,"events":int(y[ok].sum()),**summary})
    if ok.sum()<100 or np.nanstd(v[ok])==0:continue
-   vz=(v[ok]-v[ok].mean())/v[ok].std();az=(age[ok]-age[ok].mean())/age[ok].std();r=glm_term(y[ok],np.c_[vz,az,sex[ok]],["concept","age","female"],"concept");rows.append({"split":split_name,"concept":c,"n":int(ok.sum()),"events":int(y[ok].sum()),"control_median":np.nanmedian(v[ok&(y==0)]),"incident_median":np.nanmedian(v[ok&(y==1)]),"spearman_with_final_risk":stats.spearmanr(v[ok],risk[ok]).statistic,**r})
+   vz=(v[ok]-v[ok].mean())/v[ok].std();az=(age[ok]-age[ok].mean())/age[ok].std();r=glm_term(y[ok],np.c_[vz,az,sex[ok]],["concept","age","female"],"concept");rows.append({"split":split_name,"concept":c,"n":int(ok.sum()),"events":int(y[ok].sum()),"concept_mean":summary["mean"],"concept_sd":summary["sd"],"standardization":"within_partition_population_sd","control_median":np.nanmedian(v[ok&(y==0)]),"incident_median":np.nanmedian(v[ok&(y==1)]),"spearman_with_final_risk":stats.spearmanr(v[ok],risk[ok]).statistic,**r})
+   ds=dev_stats[c]
+   if np.isfinite(ds["sd"]) and ds["sd"]>0:
+    common=(v[ok]-ds["mean"])/ds["sd"]
+    sensitivity.append({"split":split_name,"concept":c,"analysis":"development_sd_age_sex","n":int(ok.sum()),"events":int(y[ok].sum()),"concept_reference_mean":ds["mean"],"concept_reference_scale":ds["sd"],**glm_term(y[ok],np.c_[common,az,sex[ok]],["concept","age","female"],"concept")})
+   if c in cross_day:
+    volume=pd.to_numeric(z.overall_activity,errors="coerce").to_numpy();both=ok&np.isfinite(volume);vs=dev_stats["overall_activity"]
+    if both.sum()>=100 and ds["sd"]>0 and vs["sd"]>0:
+     common=(v[both]-ds["mean"])/ds["sd"];az_b=(age[both]-age[both].mean())/age[both].std();volume_z=(volume[both]-vs["mean"])/vs["sd"]
+     sensitivity.append({"split":split_name,"concept":c,"analysis":"development_sd_age_sex_overall_activity","n":int(both.sum()),"events":int(y[both].sum()),"concept_reference_mean":ds["mean"],"concept_reference_scale":ds["sd"],**glm_term(y[both],np.c_[common,az_b,sex[both],volume_z],["concept","age","female","overall_activity"],"concept")})
+    ratio=np.divide(v,volume,out=np.full(len(v),np.nan),where=np.isfinite(volume)&(volume>0));dv=pd.to_numeric(q.iloc[dev][c],errors="coerce").to_numpy();dm=pd.to_numeric(q.iloc[dev].overall_activity,errors="coerce").to_numpy();dr=np.divide(dv,dm,out=np.full(len(dv),np.nan),where=np.isfinite(dm)&(dm>0));rs=distribution_summary(dr);rok=ok&np.isfinite(ratio)
+    if rok.sum()>=100 and rs["sd"]>0:
+     rz=(ratio[rok]-rs["mean"])/rs["sd"];az_r=(age[rok]-age[rok].mean())/age[rok].std()
+     sensitivity.append({"split":split_name,"concept":c,"analysis":"ratio_to_overall_activity_development_sd_age_sex","n":int(rok.sum()),"events":int(y[rok].sum()),"concept_reference_mean":rs["mean"],"concept_reference_scale":rs["sd"],**glm_term(y[rok],np.c_[rz,az_r,sex[rok]],["concept","age","female"],"concept")})
    for j in range(min(cfg.association_pcs,rep["pcs"].shape[1])):corr.append({"split":split_name,"concept":c,"latent_component":f"PC{j+1:02d}","spearman_r":stats.spearmanr(v[ok],rep["pcs"][rr,j][ok]).statistic,"p_value":stats.spearmanr(v[ok],rep["pcs"][rr,j][ok]).pvalue,"n":int(ok.sum())})
- a=pd.DataFrame(rows);a["fdr_q_value_within_split"]=a.groupby("split")["p_value"].transform(bh_fdr);a.to_csv(out/"rhythm_concept_dementia_associations.csv",index=False);c=pd.DataFrame(corr);c["fdr_q_value_within_split"]=c.groupby("split")["p_value"].transform(bh_fdr);c.to_csv(out/"rhythm_concept_latent_correlations.csv",index=False);atomic_json(out/"COMPLETED.json",{"completed":True,"concepts":concept_cols,"role":"post-hoc knowledge discovery only; no concept entered model training","discovery":"development","replication":"fixed test","causal_interpretation":False});logging.info("COMPLETED rhythm concept discovery")
+ a=pd.DataFrame(rows)
+ if len(a):a["fdr_q_value_within_split"]=a.groupby("split")["p_value"].transform(bh_fdr)
+ a.to_csv(out/"rhythm_concept_dementia_associations.csv",index=False);c=pd.DataFrame(corr)
+ if len(c):c["fdr_q_value_within_split"]=c.groupby("split")["p_value"].transform(bh_fdr)
+ c.to_csv(out/"rhythm_concept_latent_correlations.csv",index=False);pd.DataFrame(summaries).to_csv(out/"rhythm_concept_distribution_diagnostics.csv",index=False);s=pd.DataFrame(sensitivity)
+ if len(s):s["fdr_q_value_within_split_analysis"]=s.groupby(["split","analysis"])["p_value"].transform(bh_fdr)
+ s.to_csv(out/"rhythm_concept_sensitivity_associations.csv",index=False)
+ atomic_json(out/"COMPLETED.json",{"completed":True,"concepts":concept_cols,"role":"post-hoc behavioural analysis; no concept entered model training","discovery":"development","replication":"fixed test","causal_interpretation":False,"intradaily_variability":{"resolution_minutes":1,"record_minutes":10080,"numerator":"mean squared change across adjacent observed minutes, including day boundaries","denominator":"population variance of observed minutes","missingness":"no imputation or bridging of missing gaps"},"primary_concept_model":"age and sex adjusted; within-partition SD; no volume covariate","sensitivity_models":"separate output; development-fixed SD, age-sex-volume adjustment and range/overall-activity ratios","diagnostics":"partition distributions, convergence, design rank and influence summaries"});logging.info("COMPLETED rhythm concept analyses")
 
 
 def cox_fit(duration,event,X,names):
@@ -295,8 +325,66 @@ def km_curve(t,e,group):
  return rows
 
 
+def observed_followup_inputs(d,cfg):
+ """Read explicitly named times measured in days after accelerometry.
+
+ followup_days_col is the last observable/administrative day, not a duration
+ since recruitment. death_days_col is the recorded death day; missing means
+ no recorded death time. A binary is_dead flag never supplies a death time.
+ """
+ follow_col=getattr(cfg,"followup_days_col","")
+ death_col=getattr(cfg,"death_days_col","")
+ if not follow_col:
+  if death_col:raise ValueError("--death-days-col requires --followup-days-col")
+  return None
+ required=[follow_col]+([death_col] if death_col else [])
+ missing=[name for name in required if name not in d]
+ if missing:raise ValueError(f"Configured follow-up columns missing: {missing}")
+ follow=pd.to_numeric(d[follow_col],errors="coerce").to_numpy(float)
+ death=pd.to_numeric(d[death_col],errors="coerce").to_numpy(float) if death_col else np.full(len(d),np.nan)
+ valid=np.isfinite(follow)&(follow>0)&(~np.isfinite(death)|(death>=0))
+ unknown_death=np.zeros(len(d),bool)
+ if death_col and "is_dead" in d:
+  unknown_death=pd.to_numeric(d.is_dead,errors="coerce").eq(1).to_numpy()&~np.isfinite(death)
+  valid&=~unknown_death
+ return {"followup_days":follow,"death_days":death,"valid":valid,
+         "followup_column":follow_col,"death_column":death_col,
+         "known_death_without_time":unknown_death}
+
+
+def observed_survival_sensitivity(cfg,d,test,risk,agez,sex,out):
+ """Additional cause-specific analyses; fixed-window outputs stay separate."""
+ times=observed_followup_inputs(d,cfg)
+ if times is None:return {"enabled":False}
+ follow=times["followup_days"][test];death=times["death_days"][test]
+ event=d.target.to_numpy(int)[test]
+ days=pd.to_numeric(d.days_accel_to_dementia,errors="coerce").to_numpy(float)[test]
+ stop=np.minimum(follow,HORIZON_DAYS)
+ stop=np.minimum(stop,np.where(np.isfinite(death),death,np.inf))
+ invalid_order=(event==1)&np.isfinite(death)&np.isfinite(days)&(days>death)
+ eligible=times["valid"][test]&(stop>LANDMARK_DAYS)&~invalid_order&np.isfinite(risk)&np.isfinite(agez)&np.isfinite(sex)
+ observed_event=(event==1)&np.isfinite(days)&(days<=stop)
+ end=np.where(observed_event,days,stop);duration=(end-LANDMARK_DAYS)/365.25
+ eligible&=np.isfinite(duration)&(duration>0)
+ pd.DataFrame({"eid":d.eid.iloc[test].to_numpy(),"included":eligible,"fixed_window_event":event,"observed_event":observed_event.astype(int),"followup_days":follow,"death_days":death,"end_days":end,"diagnosis_after_death":invalid_order,"known_death_without_time":times["known_death_without_time"][test]}).to_csv(out/"observed_followup_eligibility.csv",index=False)
+ rows=[]
+ if observed_event[eligible].sum()>0:
+  for model,X,names in [("risk_only",risk[:,None],["final_risk_per_SD"]),("risk_age_sex",np.c_[risk,agez,sex],["final_risk_per_SD","age_per_SD","female"])]:
+   for result in cox_fit(duration[eligible],observed_event[eligible].astype(int),X[eligible],names):rows.append({"model":model,"n":int(eligible.sum()),"events":int(observed_event[eligible].sum()),**result})
+ pd.DataFrame(rows).to_csv(out/"observed_followup_cox_models.csv",index=False)
+ horizon_rows=[]
+ for years in [2.,3.,5.,7.]:
+  cutoff=365.25*years
+  case=eligible&observed_event&(days<=cutoff)
+  control=eligible&(end>=cutoff)&~case
+  use=case|control
+  horizon_rows.append({"horizon_years_from_accelerometer":years,"n_evaluable":int(use.sum()),"events_by_horizon":int(case.sum()),"complete_case_auroc":roc_auc_score(case[use].astype(int),risk[use]) if case.any() and control.any() else np.nan,"method":"observed by horizon; no IPCW"})
+ pd.DataFrame(horizon_rows).to_csv(out/"observed_followup_horizon_discrimination.csv",index=False)
+ return {"enabled":True,"followup_days_column":times["followup_column"],"death_days_column":times["death_column"],"time_origin":"accelerometry","n_included":int(eligible.sum()),"events":int(observed_event[eligible].sum()),"diagnosis_after_death_excluded":int(invalid_order.sum()),"known_death_without_time_excluded":int(times["known_death_without_time"][test].sum()),"death_handling":"cause-specific censoring when a recorded death time is supplied; no competing-risk cumulative-incidence estimator","cohort_scope":"the original fixed-window analytical cohort; excluded source participants are not recovered"}
+
+
 def run_survival(cfg):
- out=Path(cfg.output_dir);setup(out);d=load_d(cfg);_,test=split(d,cfg);rep=load_rep(Path(cfg.representation_dir));lookup={e:i for i,e in enumerate(rep["eid"].astype(str))};r=np.array([lookup[str(e)] for e in d.eid.iloc[test]],int);event=d.target.to_numpy(int)[test];days=pd.to_numeric(d.days_accel_to_dementia,errors="coerce").to_numpy()[test];duration=np.where(event==1,days-LANDMARK_DAYS,HORIZON_DAYS-LANDMARK_DAYS)/365.25;age=pd.to_numeric(d.enrollment_age,errors="coerce").to_numpy()[test];sex=(pd.to_numeric(d.gender,errors="coerce").to_numpy()[test]==2).astype(float);risk=safe_logit(rep["final_probability"][r]);risk=(risk-risk.mean())/risk.std();agez=(age-np.nanmean(age))/np.nanstd(age);rows=[]
+ out=Path(cfg.output_dir);setup(out);d=load_d(cfg);d,_=merge_optional_clinical(d,cfg.clinical_outcomes_csv);_,test=split(d,cfg);rep=load_rep(Path(cfg.representation_dir));lookup={e:i for i,e in enumerate(rep["eid"].astype(str))};r=np.array([lookup[str(e)] for e in d.eid.iloc[test]],int);event=d.target.to_numpy(int)[test];days=pd.to_numeric(d.days_accel_to_dementia,errors="coerce").to_numpy()[test];duration=np.where(event==1,days-LANDMARK_DAYS,HORIZON_DAYS-LANDMARK_DAYS)/365.25;age=pd.to_numeric(d.enrollment_age,errors="coerce").to_numpy()[test];sex=(pd.to_numeric(d.gender,errors="coerce").to_numpy()[test]==2).astype(float);risk=safe_logit(rep["final_probability"][r]);risk=(risk-risk.mean())/risk.std();agez=(age-np.nanmean(age))/np.nanstd(age);rows=[]
  for model,X,names in [("risk_only",risk[:,None],["final_risk_per_SD"]),("risk_age_sex",np.c_[risk,agez,sex],["final_risk_per_SD","age_per_SD","female"] )]:
   for q in cox_fit(duration,event,X,names):rows.append({"model":model,"n":len(event),"events":int(event.sum()),**q})
  pd.DataFrame(rows).to_csv(out/"landmark_cox_models.csv",index=False);quart=np.asarray(pd.qcut(risk,4,labels=["Q1","Q2","Q3","Q4"],duplicates="drop").astype(str));pd.DataFrame(km_curve(duration,event,quart)).to_csv(out/"landmark_km_by_risk_quartile.csv",index=False)
@@ -313,14 +401,13 @@ def run_survival(cfg):
   ok=np.isfinite(dur)&(dur>0)
   if ev[ok].sum()>=5:
    for q in cox_fit(dur[ok],ev[ok],np.c_[risk[ok],agez[ok],sex[ok]],["final_risk_per_SD","age_per_SD","female"]):subrows.append({"subtype":name,"n":int(ok.sum()),"events":int(ev[ok].sum()),**q})
- pd.DataFrame(subrows).to_csv(out/"cause_specific_subtype_cox.csv",index=False);atomic_json(out/"COMPLETED.json",{"completed":True,"design":"365-day landmark; follow from year 1 through year 7","control_censoring":"administrative at 7 years in the fixed-horizon eligible cohort","death_competing_risk_performed":False,"warning":"Death date is not present; binary is_dead cannot define competing-event time."});logging.info("COMPLETED survival sensitivity")
+ pd.DataFrame(subrows).to_csv(out/"cause_specific_subtype_cox.csv",index=False)
+ observed=observed_survival_sensitivity(cfg,d,test,risk,agez,sex,out)
+ atomic_json(out/"COMPLETED.json",{"completed":True,"design":"365-day landmark; follow from year 1 through year 7","control_censoring":"administrative at 7 years in the fixed-horizon eligible cohort","death_competing_risk_performed":False,"horizon_auc_method":"binary horizon labels; no IPCW","observed_followup_sensitivity":observed,"time_input_contract":"optional day fields start at accelerometry; no death time inferred from is_dead"});logging.info("COMPLETED survival analyses")
 
 
 def glm_term(y,X,names,target):
- try:
-  import statsmodels.api as sm
-  fit=sm.GLM(y,sm.add_constant(np.asarray(X,float)),family=sm.families.Binomial()).fit();j=names.index(target)+1;return {"coefficient":fit.params[j],"se":fit.bse[j],"odds_ratio":np.exp(fit.params[j]),"ci_low":np.exp(fit.params[j]-1.96*fit.bse[j]),"ci_high":np.exp(fit.params[j]+1.96*fit.bse[j]),"p_value":fit.pvalues[j]}
- except Exception as e:return {"coefficient":np.nan,"se":np.nan,"odds_ratio":np.nan,"ci_low":np.nan,"ci_high":np.nan,"p_value":np.nan,"error":repr(e)}
+ return binomial_term(y,X,names,target)
 
 
 def merge_optional_clinical(d,path):
@@ -345,6 +432,33 @@ def run_interactions(cfg):
 
 def fit_binary_probe(Xd,yd,Xt):
  m=Pipeline([("imp",SimpleImputer(strategy="median",add_indicator=True)),("sc",StandardScaler()),("lr",LogisticRegression(C=.03,class_weight="balanced",solver="liblinear",max_iter=4000))]).fit(Xd,yd);return m,m.predict_proba(Xt)[:,1]
+
+
+def mortality_time_inputs(d,cfg):
+ """Use recorded death/censor times, or the supplied endpoint-age field.
+
+ The endpoint-age field must contain age at death for deceased participants
+ and age at censoring for survivors. enrollment_age is age at accelerometry.
+ An explicit mortality-time column follows that same death/censor contract.
+ """
+ duration_col=getattr(cfg,"mortality_time_days_col","")
+ if duration_col:
+  if duration_col not in d or "is_dead" not in d:raise ValueError("--mortality-time-days-col requires the named column and is_dead")
+  follow=pd.to_numeric(d[duration_col],errors="coerce").to_numpy(float)/365.25
+  event=pd.to_numeric(d.is_dead,errors="coerce").to_numpy(float)
+  valid=np.isfinite(follow)&(follow>0)&np.isin(event,[0,1])
+  return follow,event,valid,{"source":duration_col,"unit":"days from accelerometry to death or censoring"}
+ if getattr(cfg,"followup_days_col","") and getattr(cfg,"death_days_col",""):
+  times=observed_followup_inputs(d,cfg);end=times["followup_days"];death=times["death_days"]
+  event=(np.isfinite(death)&(death<=end)).astype(int)
+  follow=np.minimum(end,np.where(np.isfinite(death),death,np.inf))/365.25
+  valid=times["valid"]&np.isfinite(follow)&(follow>0)
+  return follow,event,valid,{"source":"explicit observation and death day columns","followup_column":times["followup_column"],"death_column":times["death_column"],"time_origin":"accelerometry"}
+ if {"is_dead","Followingyears_birthday","enrollment_age"}.issubset(d.columns):
+  follow=pd.to_numeric(d.Followingyears_birthday,errors="coerce").to_numpy()-pd.to_numeric(d.enrollment_age,errors="coerce").to_numpy();event=pd.to_numeric(d.is_dead,errors="coerce").to_numpy()
+  valid=np.isfinite(follow)&(follow>0)&np.isin(event,[0,1])
+  return follow,event,valid,{"source":"Followingyears_birthday minus enrollment_age","unit":"years","field_contract":"endpoint age is age at death for deceased participants and age at censoring for survivors; enrollment_age is age at accelerometry"}
+ return None
 
 
 def run_clinical_associations(cfg):
@@ -373,16 +487,18 @@ def run_clinical_associations(cfg):
      X=np.c_[np.ones(ok.sum()),vz,az,sx];coef=np.linalg.lstsq(X,yy[ok],rcond=None)[0];res=yy[ok]-X@coef;df=max(ok.sum()-X.shape[1],1);s2=np.sum(res**2)/df;cov=s2*np.linalg.pinv(X.T@X);se=np.sqrt(cov[1,1]);r={"coefficient":coef[1],"se":se,"ci_low":coef[1]-1.96*se,"ci_high":coef[1]+1.96*se,"p_value":2*stats.t.sf(abs(coef[1]/se),df)}
     assoc.append({"outcome":name,"outcome_type":kind,"split":split_name,"feature":fn,"n":int(ok.sum()),**r})
  pd.DataFrame(rows).to_csv(out/"clinical_linear_probe_test_metrics.csv",index=False);a=pd.DataFrame(assoc);a["fdr_q_value_within_split_outcome"]=a.groupby(["outcome","split"])["p_value"].transform(bh_fdr) if len(a) else [];a.to_csv(out/"latent_clinical_associations.csv",index=False)
- mortality=[]
- if {"is_dead","Followingyears_birthday","enrollment_age"}.issubset(d.columns):
-  follow=pd.to_numeric(d.Followingyears_birthday,errors="coerce").to_numpy()-pd.to_numeric(d.enrollment_age,errors="coerce").to_numpy();death=pd.to_numeric(d.is_dead,errors="coerce").to_numpy()
+ mortality=[];mortality_inputs=mortality_time_inputs(d,cfg);mortality_contract={"available":False}
+ if mortality_inputs is not None:
+  follow,death,time_valid,mortality_contract=mortality_inputs
   for split_name,ids,rr in [("development",dev,rd),("test",test,rt)]:
-   risk=safe_logit(rep["final_probability"][rr]);aa=age[ids];sx=(sex[ids]==2).astype(float);ok=np.isfinite(follow[ids])&np.isfinite(death[ids])&np.isfinite(aa)&(follow[ids]>0);rz=(risk[ok]-risk[ok].mean())/risk[ok].std();az=(aa[ok]-aa[ok].mean())/aa[ok].std()
+   risk=safe_logit(rep["final_probability"][rr]);aa=age[ids];sx=(sex[ids]==2).astype(float);ok=time_valid[ids]&np.isfinite(aa)&np.isfinite(sex[ids])&np.isfinite(risk)
+   if ok.sum()<5 or death[ids][ok].sum()==0:continue
+   rz=(risk[ok]-risk[ok].mean())/risk[ok].std();az=(aa[ok]-aa[ok].mean())/aa[ok].std()
    for q in cox_fit(follow[ids][ok],death[ids][ok].astype(int),np.c_[rz,az,sx[ok]],["final_risk_per_SD","age_per_SD","female"]):mortality.append({"split":split_name,"model":"final_risk_age_sex","n":int(ok.sum()),"deaths":int(death[ids][ok].sum()),**q})
    for j in range(min(4,rep["pcs"].shape[1])):
     pc=rep["pcs"][rr,j][ok];pc=(pc-pc.mean())/pc.std()
     for q in cox_fit(follow[ids][ok],death[ids][ok].astype(int),np.c_[pc,az,sx[ok]],[f"PC{j+1:02d}_per_SD","age_per_SD","female"]):mortality.append({"split":split_name,"model":f"PC{j+1:02d}_age_sex","n":int(ok.sum()),"deaths":int(death[ids][ok].sum()),**q})
- pd.DataFrame(mortality).to_csv(out/"mortality_cox_associations.csv",index=False);atomic_json(out/"COMPLETED.json",{"completed":True,"outcomes_analyzed":[x[0] for x in outcomes],"optional_columns_merged":extra,"comorbidity_columns_found":comorbidity_columns(d,cfg.comorbidity_cols),"mortality_time":"Followingyears_birthday minus enrollment_age; audited as outcome-only follow-up time","warning":"Post-hoc representation associations do not establish causality and outcome variables never enter the dementia predictor."});logging.info("COMPLETED clinical representation associations")
+ pd.DataFrame(mortality).to_csv(out/"mortality_cox_associations.csv",index=False);atomic_json(out/"COMPLETED.json",{"completed":True,"outcomes_analyzed":[x[0] for x in outcomes],"optional_columns_merged":extra,"comorbidity_columns_found":comorbidity_columns(d,cfg.comorbidity_cols),"mortality_time":mortality_contract,"warning":"Post-hoc representation associations do not establish causality and outcome variables never enter the dementia predictor."});logging.info("COMPLETED clinical representation associations")
 
 
 def paired_delta(y,a,b,n,seed):
@@ -401,13 +517,45 @@ def run_final_paired(cfg):
 
 
 def smoke(cfg):
- out=Path(cfg.output_dir);setup(out);required=[Path(cfg.core_dir)/"COMPLETED.json",Path(cfg.protocol_dir)/"V13_PROTOCOL_LOCK.json",Path(cfg.subtypes_csv),Path(cfg.cache_dir)/"activity_7d.npy",Path(cfg.cache_dir)/"observed_7d.npy"];missing=[str(p) for p in required if not p.exists()]
+ out=Path(cfg.output_dir);setup(out);required=[Path(cfg.core_dir)/"COMPLETED.json",Path(cfg.protocol_dir)/"PROTOCOL_LOCK.json",Path(cfg.subtypes_csv),Path(cfg.cache_dir)/"activity_7d.npy",Path(cfg.cache_dir)/"observed_7d.npy"];missing=[str(p) for p in required if not p.exists()]
  if missing:raise FileNotFoundError("Missing clinical-extension prerequisites:\n"+"\n".join(missing))
- d=pd.read_csv(cfg.labels_csv,nrows=2);s=pd.read_csv(cfg.subtypes_csv,nrows=2);cp=Path(cfg.clinical_outcomes_csv);clinical=pd.read_csv(cp,low_memory=False) if cp.exists() else pd.DataFrame();detected=comorbidity_columns(clinical,cfg.comorbidity_cols) if len(clinical.columns) else [];audit={"completed":True,"labels_columns":list(d.columns),"subtype_columns":list(s.columns),"clinical_outcomes_csv":str(cp),"clinical_outcomes_csv_exists":cp.exists(),"clinical_outcome_columns":list(clinical.columns),"requested_comorbidity_columns":cfg.comorbidity_cols or "auto-detect","detected_comorbidity_columns":detected,"warning":None if detected else "No comorbidity index detected; mortality analysis can run, but set V13_COMORBIDITY_COLS before the full clinical association stages.","weights_changed":False};atomic_json(out/"SMOKE_COMPLETED.json",audit);logging.info("Clinical extension smoke OK comorbidity=%s",detected)
+ d=pd.read_csv(cfg.labels_csv,nrows=2);s=pd.read_csv(cfg.subtypes_csv,nrows=2);cp=Path(cfg.clinical_outcomes_csv);clinical=pd.read_csv(cp,low_memory=False) if cp.exists() else pd.DataFrame();detected=comorbidity_columns(clinical,cfg.comorbidity_cols) if len(clinical.columns) else [];audit={"completed":True,"labels_columns":list(d.columns),"subtype_columns":list(s.columns),"clinical_outcomes_csv":str(cp),"clinical_outcomes_csv_exists":cp.exists(),"clinical_outcome_columns":list(clinical.columns),"requested_comorbidity_columns":cfg.comorbidity_cols or "auto-detect","detected_comorbidity_columns":detected,"warning":None if detected else "No comorbidity index detected; specify --comorbidity-cols for the clinical association stages.","weights_changed":False};atomic_json(out/"SMOKE_COMPLETED.json",audit);logging.info("Clinical extension smoke OK comorbidity=%s",detected)
 
 
 def parse():
- a=argparse.ArgumentParser(description=__doc__);a.add_argument("stage",choices=["clinical_smoke","representations","subtypes","temporal_shapley","rhythm_concepts","survival","interactions","clinical_associations","final_paired"]);a.add_argument("--labels-csv",default=str(ROOT/"ukb_dementia_labels_covariates_N80990.csv"));a.add_argument("--apoe-csv",default=str(ROOT/"APOE_phenotype.csv"));a.add_argument("--subtypes-csv",default=str(ROOT/"ukb_dementia_subtypes_N80990.csv"));a.add_argument("--clinical-outcomes-csv",default=str(ROOT/"UKB_Demographic_clinic_PA_baseline.csv"));a.add_argument("--comorbidity-cols",default="");a.add_argument("--cache-dir",default=str(ROOT/"supervised_results"/"cache"));a.add_argument("--core-dir",default=str(RESULTS/"02_core_model"));a.add_argument("--protocol-dir",default=str(RESULTS/"00_protocol"));a.add_argument("--representation-dir",default=str(RESULTS/"11_representations"));a.add_argument("--ablation-dir",default=str(RESULTS/"08_ablation"));a.add_argument("--apoe-dir",default=str(RESULTS/"03_apoe_secondary"));a.add_argument("--output-dir",required=True);a.add_argument("--bootstrap-repeats",type=int,default=2000);a.add_argument("--explanation-bootstrap-repeats",type=int,default=1000);a.add_argument("--shapley-permutations",type=int,default=16);a.add_argument("--explanation-control-ratio",type=int,default=1);a.add_argument("--reference-participants",type=int,default=1024);a.add_argument("--pca-components",type=int,default=16);a.add_argument("--association-pcs",type=int,default=16);a.add_argument("--rhythm-batch-size",type=int,default=256);a.add_argument("--minimum-subtype-development-events",type=int,default=20);a.add_argument("--minimum-subtype-test-events",type=int,default=5);a.add_argument("--extract-batch-size",type=int,default=128);a.add_argument("--eval-batch-size",type=int,default=256);a.add_argument("--num-workers",type=int,default=6);a.add_argument("--seed",type=int,default=20260820);a.add_argument("--amp",action=argparse.BooleanOptionalAction,default=True);return a.parse_args()
+ a=argparse.ArgumentParser(description=__doc__)
+ a.add_argument("stage",choices=["clinical_smoke","representations","subtypes","temporal_shapley","rhythm_concepts","survival","interactions","clinical_associations","final_paired"])
+ a.add_argument("--labels-csv",default=str(ROOT/"ukb_dementia_labels_covariates_N80990.csv"))
+ a.add_argument("--apoe-csv",default=str(ROOT/"APOE_phenotype.csv"))
+ a.add_argument("--subtypes-csv",default=str(ROOT/"ukb_dementia_subtypes_N80990.csv"))
+ a.add_argument("--clinical-outcomes-csv",default=str(ROOT/"UKB_Demographic_clinic_PA_baseline.csv"),help="Additional EID-aligned clinical fields, including explicitly named time columns if supplied.")
+ a.add_argument("--comorbidity-cols",default="")
+ a.add_argument("--followup-days-col",default="",help="Optional last observable/administrative day since accelerometry; produces separate observed-follow-up sensitivities within the fixed analytical cohort.")
+ a.add_argument("--death-days-col",default="",help="Optional recorded day of death since accelerometry; requires --followup-days-col. No time is inferred from is_dead.")
+ a.add_argument("--mortality-time-days-col",default="",help="Optional days from accelerometry to death (is_dead=1) or censoring (is_dead=0); takes precedence for mortality Cox models.")
+ a.add_argument("--cache-dir",default=str(ROOT/"cache"))
+ a.add_argument("--core-dir",default=str(RESULTS/"02_core_model"))
+ a.add_argument("--protocol-dir",default=str(RESULTS/"00_protocol"))
+ a.add_argument("--representation-dir",default=str(RESULTS/"11_representations"))
+ a.add_argument("--ablation-dir",default=str(RESULTS/"08_ablation"))
+ a.add_argument("--apoe-dir",default=str(RESULTS/"03_apoe_secondary"))
+ a.add_argument("--output-dir",required=True)
+ a.add_argument("--bootstrap-repeats",type=int,default=2000)
+ a.add_argument("--explanation-bootstrap-repeats",type=int,default=1000)
+ a.add_argument("--shapley-permutations",type=int,default=16)
+ a.add_argument("--explanation-control-ratio",type=int,default=1)
+ a.add_argument("--reference-participants",type=int,default=1024)
+ a.add_argument("--pca-components",type=int,default=16)
+ a.add_argument("--association-pcs",type=int,default=16)
+ a.add_argument("--rhythm-batch-size",type=int,default=256)
+ a.add_argument("--minimum-subtype-development-events",type=int,default=20)
+ a.add_argument("--minimum-subtype-test-events",type=int,default=5)
+ a.add_argument("--extract-batch-size",type=int,default=128)
+ a.add_argument("--eval-batch-size",type=int,default=256)
+ a.add_argument("--num-workers",type=int,default=6)
+ a.add_argument("--seed",type=int,default=20260820)
+ a.add_argument("--amp",action=argparse.BooleanOptionalAction,default=True)
+ return a.parse_args()
 
 
 if __name__=="__main__":

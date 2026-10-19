@@ -1,0 +1,6 @@
+{
+  "raw_count": "../data/external_validation/nhats_r11_daily_7x1440_raw_count.csv",
+  "positive_robust": "../data/external_validation/nhats_r11_daily_7x1440_positive_robust.csv",
+  "positive_quantile": "../data/external_validation/nhats_r11_daily_7x1440_positive_quantile.csv",
+  "learned_adapter": "../data/external_validation/nhats_r11_adapter_daily_7x1440_raw.csv"
+}
